@@ -25,6 +25,7 @@ def preprocess(data_name, meta_path):
                 i_map[i] = i_ind
                 i_ind += 1
 
+    #获取id和
     i_meta_map = {}
     with open(meta_path, 'r', encoding='latin-1') as f:
         for line in f:

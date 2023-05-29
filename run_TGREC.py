@@ -22,7 +22,7 @@ from utils import EarlyStopMonitor
 from tqdm import tqdm
 import multiprocessing
 import metrics
-
+from torchsummary import summary
 
 ### Argument and global variables
 parser = argparse.ArgumentParser('Interface for TGSRec experiments on link predictions')
@@ -86,6 +86,7 @@ logger.setLevel(logging.DEBUG)
 fh = logging.FileHandler('log/{}.log'.format(str(time.time())))
 fh.setLevel(logging.DEBUG)
 ch = logging.StreamHandler()
+ch = logging.StreamHandler()
 ch.setLevel(logging.WARN)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 fh.setFormatter(formatter)
@@ -120,17 +121,23 @@ np.random.seed(2020)
 
 
 ### Model initialize
-device = torch.device('cuda:{}'.format(GPU))
+#device = torch.device('cuda:{}'.format(GPU))
+device = torch.device('cpu')
 n_nodes = data.max_idx
+n_ill = data.num_ill
 print(n_nodes, "n nodes")
 n_edges = data.num_total_edges
 print(n_edges, "n edges")
-tgan = TGRec(data.train_ngh_finder, n_nodes+1, args,
+tgan = TGRec(data.train_ngh_finder, n_nodes+1, args, n_ill,
             num_layers=NUM_LAYER, use_time=USE_TIME, agg_method=AGG_METHOD, attn_mode=ATTN_MODE,
             seq_len=SEQ_LEN, n_head=NUM_HEADS, drop_out=DROP_OUT, node_dim=NODE_DIM, time_dim=TIME_DIM)
 optimizer = torch.optim.Adam(tgan.parameters(), lr=LEARNING_RATE)
 #criterion = torch.nn.BCELoss()
 tgan = tgan.to(device)
+
+
+print(tgan)
+#summary(tgan, input_size=[(BATCH_SIZE, 32), (BATCH_SIZE, 32), (BATCH_SIZE, 32)])
 
 num_instance = len(data.train_src_l)
 num_batch = math.ceil(num_instance / BATCH_SIZE)
@@ -155,8 +162,12 @@ for epoch in range(NUM_EPOCH):
         e_idx = min(num_instance - 1, s_idx + BATCH_SIZE)
         src_l_cut, dst_l_cut = data.train_src_l[s_idx:e_idx], data.train_dst_l[s_idx:e_idx]
         ts_l_cut = data.train_ts_l[s_idx:e_idx]
+        ill_l_cut = data.train_ill_l[s_idx:e_idx]
         label_l_cut = data.train_label_l[s_idx:e_idx]
         size = len(src_l_cut)
+
+
+
         #_, dst_l_fake = train_rand_sampler.sample(size)
         if args.popnegsample:
             dst_l_fake = data.train_rand_sampler.popularity_based_sample_neg(src_l_cut)
@@ -170,8 +181,10 @@ for epoch in range(NUM_EPOCH):
         #    neg_label = torch.zeros(size, dtype=torch.float, device=device)
         
         optimizer.zero_grad()
+        #切换训练模式
         tgan = tgan.train()
-        pos_score, neg_score = tgan.contrast_nosigmoid(src_l_cut, dst_l_cut, dst_l_fake, ts_l_cut, NUM_NEIGHBORS)
+        #也许不一定要调用forward()函数，这样也是可以的
+        pos_score, neg_score = tgan.contrast_nosigmoid(src_l_cut, dst_l_cut, dst_l_fake, ts_l_cut, ill_l_cut, NUM_NEIGHBORS)
         #pos_prob, neg_prob = tgan.contrast(src_l_cut, dst_l_cut, dst_l_fake, ts_l_cut, NUM_NEIGHBORS)
     
         #loss = criterion(pos_prob, pos_label)
@@ -185,6 +198,7 @@ for epoch in range(NUM_EPOCH):
         
         #pos_prob, neg_prob = pos_score.sigmoid(), neg_score.sigmoid()
         loss.backward()
+        #更新参数
         optimizer.step()
         # get training results
         with torch.no_grad():

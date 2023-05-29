@@ -221,6 +221,18 @@ class TimeEncode(torch.nn.Module):
 
         return harmonic #self.dense(harmonic)
 
+#输入seq_len个id，输出维度为expand_dim？
+class IllEncode(torch.nn.Module):
+    def __init__(self, n_ills, expand_dim):
+        super(IllEncode, self).__init__()
+        self.Illembedding = nn.Embedding(num_embeddings=n_ills, embedding_dim=expand_dim)
+
+    #接受id 输入32维向量
+    def forward(self, disease_ids):
+        IllEmbedded = self.Illembedding(disease_ids)
+        return IllEmbedded
+
+
 class DisentangleTimeEncode(torch.nn.Module):
     def __init__(self, components, expand_dim, factor=5):
         super(DisentangleTimeEncode, self).__init__()
@@ -402,9 +414,9 @@ class AttnModel(torch.nn.Module):
         output = self.merger(output, src)
         return output, attn
 
-
+#代码里似乎并没有直接的拼接操作  拼接只是论文上的写法
 class TGRec(torch.nn.Module):
-    def __init__(self, ngh_finder, n_nodes, args,
+    def __init__(self, ngh_finder, n_nodes, args, n_ills,
                  attn_mode='prod', use_time='time', agg_method='attn', node_dim=32, time_dim=32,
                  num_layers=3, n_head=4, null_idx=0, num_heads=1, drop_out=0.1, seq_len=None):
         super(TGRec, self).__init__()
@@ -466,11 +478,13 @@ class TGRec(torch.nn.Module):
             self.time_encoder = DisentangleTimeEncode(args.disencomponents, expand_dim=time_dim)
         else:
             raise ValueError('invalid time option!')
-        
+
+        self.IllEncode = IllEncode(n_ills, node_dim)
+
         self.affinity_score = MergeLayer(self.feat_dim, self.feat_dim, self.feat_dim, 1) #torch.nn.Bilinear(self.feat_dim, self.feat_dim, 1, bias=True)
         
     def forward(self, src_idx_l, target_idx_l, cut_time_l, num_neighbors=20):
-        
+
         src_embed = self.tem_conv(src_idx_l, cut_time_l, self.num_layers, num_neighbors)
         target_embed = self.tem_conv(target_idx_l, cut_time_l, self.num_layers, num_neighbors)
         
@@ -487,10 +501,10 @@ class TGRec(torch.nn.Module):
         neg_score = self.affinity_score(src_embed, background_embed).squeeze(dim=-1)
         return pos_score.sigmoid(), neg_score.sigmoid()
 
-    def contrast_nosigmoid(self, src_idx_l, target_idx_l, background_idx_l, cut_time_l, num_neighbors=20):
-        src_embed = self.tem_conv(src_idx_l, cut_time_l, self.num_layers, num_neighbors)
-        target_embed = self.tem_conv(target_idx_l, cut_time_l, self.num_layers, num_neighbors)
-        background_embed = self.tem_conv(background_idx_l, cut_time_l, self.num_layers, num_neighbors)
+    def contrast_nosigmoid(self, src_idx_l, target_idx_l, background_idx_l, cut_time_l, cut_ill_l, num_neighbors=20):
+        src_embed = self.tem_conv(src_idx_l, cut_time_l, cut_ill_l, self.num_layers, num_neighbors)
+        target_embed = self.tem_conv(target_idx_l, cut_time_l, cut_ill_l, self.num_layers, num_neighbors)
+        background_embed = self.tem_conv(background_idx_l, cut_time_l, cut_ill_l, self.num_layers, num_neighbors)
         pos_score = self.affinity_score(src_embed, target_embed).squeeze(dim=-1)
         neg_score = self.affinity_score(src_embed, background_embed).squeeze(dim=-1)
         return pos_score, neg_score
@@ -520,34 +534,50 @@ class TGRec(torch.nn.Module):
         return weighted_time_emb
 
 
-
-    def tem_conv(self, src_idx_l, cut_time_l, curr_layers, num_neighbors=20):
+    # 递归  时序图卷积操作
+    def tem_conv(self, src_idx_l, cut_time_l, cut_ill_l, curr_layers, num_neighbors=20):
         assert(curr_layers >= 0)
-        
-        device = torch.device('cuda:{}'.format(0))
-    
+        print('tem_conv_curr_layers:', curr_layers)
+        #device = torch.device('cuda:{}'.format(0))
+        device = torch.device('cpu')
         batch_size = len(src_idx_l)
-        
+
+        #转换为torch张量放到设备上
         src_node_batch_th = torch.from_numpy(src_idx_l).long().to(device)
         cut_time_l_th = torch.from_numpy(cut_time_l).float().to(device)
-        
+        cut_ill_l_th = torch.from_numpy(cut_ill_l).long().to(device)
+
+        #维度扩张
         cut_time_l_th = torch.unsqueeze(cut_time_l_th, dim=1)
+
+        #time embedding
         # query node always has the start time -> time span == 0
         src_node_t_embed = self.time_encoder(torch.zeros_like(cut_time_l_th))
+        # 用户历史嵌入向量
         src_node_feat = self.node_hist_embed(src_node_batch_th)
-        
+        print('用户历史嵌入向量', src_node_feat)
+
+        # ill embedding  输入ill_id
+        src_node_ill = self.IllEncode(cut_ill_l_th)
+        print('ill embedding', src_node_ill)
+
+        # 层数是0就返回 user本身的embedding
         if curr_layers == 0:
             return src_node_feat
         else:
+            #当l = 1时 这里就是 src_node_feat， 否则是转换后的src_node_conv_feat
             src_node_conv_feat = self.tem_conv(src_idx_l, 
                                            cut_time_l,
+                                           cut_ill_l,
                                            curr_layers=curr_layers - 1, 
                                            num_neighbors=num_neighbors)
+
+
             if self.use_time == 'disentangle':
                 src_node_t_embed = self.time_att_aggregate(src_node_conv_feat, src_node_t_embed)
             
-            
-            src_ngh_node_batch, src_ngh_eidx_batch, src_ngh_t_batch = self.ngh_finder.get_temporal_neighbor( 
+            #获取邻居
+            src_ngh_node_batch, src_ngh_eidx_batch, src_ngh_t_batch = self.ngh_finder.get_temporal_neighbor(
                                                                     src_idx_l, 
                                                                     cut_time_l, 
                                                                     num_neighbors=num_neighbors)
@@ -556,12 +586,15 @@ class TGRec(torch.nn.Module):
             
             src_ngh_t_batch_delta = cut_time_l[:, np.newaxis] - src_ngh_t_batch
             src_ngh_t_batch_th = torch.from_numpy(src_ngh_t_batch_delta).float().to(device)
-            
+
             # get previous layer's node features
             src_ngh_node_batch_flat = src_ngh_node_batch.flatten() #reshape(batch_size, -1)
-            src_ngh_t_batch_flat = src_ngh_t_batch.flatten() #reshape(batch_size, -1)  
+            src_ngh_t_batch_flat = src_ngh_t_batch.flatten() #reshape(batch_size, -1)
+
+            #ill的迭代 待修改
             src_ngh_node_conv_feat = self.tem_conv(src_ngh_node_batch_flat, 
                                                    src_ngh_t_batch_flat,
+                                                   cut_ill_l,
                                                    curr_layers=curr_layers - 1, 
                                                    num_neighbors=num_neighbors)
             src_ngh_feat = src_ngh_node_conv_feat.view(batch_size, num_neighbors, -1)
@@ -574,7 +607,8 @@ class TGRec(torch.nn.Module):
             # attention aggregation
             mask = src_ngh_node_batch_th == 0
             attn_m = self.attn_model_list[curr_layers - 1]
-                        
+
+            #TCA? temporal collaborative attention
             local, weight = attn_m(src_node_conv_feat, 
                                    src_node_t_embed,
                                    src_ngh_feat,
